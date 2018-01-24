@@ -22,10 +22,13 @@ package org.apache.hadoop.fs.adl;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.microsoft.azure.datalake.auth.AdlOperationType;
+import com.microsoft.azure.datalake.store.*;
 import com.microsoft.azure.datalake.store.ADLStoreClient;
 import com.microsoft.azure.datalake.store.ADLStoreOptions;
 import com.microsoft.azure.datalake.store.DirectoryEntry;
@@ -36,7 +39,6 @@ import com.microsoft.azure.datalake.store.UserGroupRepresentation;
 import com.microsoft.azure.datalake.store.oauth2.AccessTokenProvider;
 import com.microsoft.azure.datalake.store.oauth2.ClientCredsTokenProvider;
 import com.microsoft.azure.datalake.store.oauth2.RefreshTokenBasedTokenProvider;
-
 import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -53,6 +55,9 @@ import org.apache.hadoop.fs.InvalidPathException;
 import org.apache.hadoop.fs.Options;
 import org.apache.hadoop.fs.Options.Rename;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.adl.auth.AdlAuthorizationException;
+import org.apache.hadoop.fs.adl.auth.AdlAuthorizer;
+import org.apache.hadoop.fs.adl.auth.AdlAuthorizerFactory;
 import org.apache.hadoop.fs.adl.oauth2.AzureADTokenProvider;
 import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.AclStatus;
@@ -75,6 +80,11 @@ import static org.apache.hadoop.fs.adl.AdlConfKeys.*;
 public class AdlFileSystem extends FileSystem {
   public static final String SCHEME = "adl";
   static final int DEFAULT_PORT = 443;
+
+  static {
+    AdlConfKeys.addDeprecatedKeys();
+  }
+
   private URI uri;
   private String userName;
   private boolean overrideOwner;
@@ -82,15 +92,10 @@ public class AdlFileSystem extends FileSystem {
   private Path workingDirectory;
   private boolean aclBitStatus;
   private UserGroupRepresentation oidOrUpn;
-
-
+  private AdlAuthorizer authorizer;
   // retained for tests
   private AccessTokenProvider tokenProvider;
   private AzureADTokenProvider azureTokenProvider;
-
-  static {
-    AdlConfKeys.addDeprecatedKeys();
-  }
 
   @Override
   public String getScheme() {
@@ -193,6 +198,10 @@ public class AdlFileSystem extends FileSystem {
         ADL_ENABLEUPN_FOR_OWNERGROUP_DEFAULT);
     oidOrUpn = enableUPN ? UserGroupRepresentation.UPN :
         UserGroupRepresentation.OID;
+
+    // Initialize ADLS authorizer
+    //
+    this.authorizer = AdlAuthorizerFactory.create(conf);
   }
 
   /**
@@ -337,6 +346,7 @@ public class AdlFileSystem extends FileSystem {
   public FSDataOutputStream create(Path f, FsPermission permission,
       boolean overwrite, int bufferSize, short replication, long blockSize,
       Progressable progress) throws IOException {
+    performADLAuthCheck(FsAction.WRITE, f);
     statistics.incrementWriteOps(1);
     IfExists overwriteRule = overwrite ? IfExists.OVERWRITE : IfExists.FAIL;
     return new FSDataOutputStream(new AdlFsOutputStream(adlClient
@@ -367,6 +377,7 @@ public class AdlFileSystem extends FileSystem {
   public FSDataOutputStream createNonRecursive(Path f, FsPermission permission,
       EnumSet<CreateFlag> flags, int bufferSize, short replication,
       long blockSize, Progressable progress) throws IOException {
+    performADLAuthCheck(FsAction.WRITE, f);
     statistics.incrementWriteOps(1);
     IfExists overwriteRule = IfExists.FAIL;
     for (CreateFlag flag : flags) {
@@ -394,6 +405,7 @@ public class AdlFileSystem extends FileSystem {
   @Override
   public FSDataOutputStream append(Path f, int bufferSize,
       Progressable progress) throws IOException {
+    performADLAuthCheck(FsAction.WRITE, f);
     statistics.incrementWriteOps(1);
     return new FSDataOutputStream(
         new AdlFsOutputStream(adlClient.getAppendStream(toRelativeFilePath(f)),
@@ -435,6 +447,7 @@ public class AdlFileSystem extends FileSystem {
   @Override
   public FSDataInputStream open(final Path f, final int buffersize)
       throws IOException {
+    performADLAuthCheck(FsAction.READ, f);
     statistics.incrementReadOps(1);
     return new FSDataInputStream(
         new AdlFsInputStream(adlClient.getReadStream(toRelativeFilePath(f)),
@@ -451,6 +464,7 @@ public class AdlFileSystem extends FileSystem {
    */
   @Override
   public FileStatus getFileStatus(final Path f) throws IOException {
+    performADLAuthCheck(FsAction.READ, f);
     statistics.incrementReadOps(1);
     DirectoryEntry entry =
         adlClient.getDirectoryEntry(toRelativeFilePath(f), oidOrUpn);
@@ -468,6 +482,7 @@ public class AdlFileSystem extends FileSystem {
    */
   @Override
   public FileStatus[] listStatus(final Path f) throws IOException {
+    performADLAuthCheck(FsAction.READ, f);
     statistics.incrementReadOps(1);
     List<DirectoryEntry> entries =
         adlClient.enumerateDirectory(toRelativeFilePath(f), oidOrUpn);
@@ -487,6 +502,7 @@ public class AdlFileSystem extends FileSystem {
    */
   @Override
   public boolean rename(final Path src, final Path dst) throws IOException {
+    performADLAuthCheck(FsAction.READ_WRITE, src, dst);
     statistics.incrementWriteOps(1);
     if (toRelativeFilePath(src).equals("/")) {
       return false;
@@ -520,6 +536,7 @@ public class AdlFileSystem extends FileSystem {
    */
   @Override
   public void concat(final Path trg, final Path[] srcs) throws IOException {
+    performADLAuthCheck(FsAction.READ_WRITE, srcs);
     statistics.incrementWriteOps(1);
     List<String> sourcesList = new ArrayList<String>();
     for (Path entry : srcs) {
@@ -542,6 +559,7 @@ public class AdlFileSystem extends FileSystem {
   @Override
   public boolean delete(final Path path, final boolean recursive)
       throws IOException {
+    performADLAuthCheck(FsAction.WRITE, path);
     statistics.incrementWriteOps(1);
     String relativePath = toRelativeFilePath(path);
     // Delete on root directory not supported.
@@ -574,6 +592,7 @@ public class AdlFileSystem extends FileSystem {
   @Override
   public boolean mkdirs(final Path path, final FsPermission permission)
       throws IOException {
+    performADLAuthCheck(FsAction.WRITE, path);
     statistics.incrementWriteOps(1);
     return adlClient.createDirectory(toRelativeFilePath(path),
         Integer.toOctalString(applyUMask(permission).toShort()));
@@ -793,9 +812,14 @@ public class AdlFileSystem extends FileSystem {
   @Override
   public void access(final Path path, FsAction mode) throws IOException {
     statistics.incrementReadOps(1);
-    if (!adlClient.checkAccess(toRelativeFilePath(path), mode.SYMBOL)) {
+    if (!checkAccess(path, mode)) {
       throw new AccessControlException("Access Denied : " + path.toString());
     }
+  }
+
+  private boolean checkAccess(final Path path, FsAction mode) throws IOException {
+    return (adlClient.checkAccess(toRelativeFilePath(path), mode.SYMBOL) ||
+        (authorizer != null && authorizer.isAuthorized(mode, path)));
   }
 
   /**
@@ -982,5 +1006,38 @@ public class AdlFileSystem extends FileSystem {
   public void setUserGroupRepresentationAsUPN(boolean enableUPN) {
     oidOrUpn = enableUPN ? UserGroupRepresentation.UPN :
         UserGroupRepresentation.OID;
+  }
+
+  /**
+   * Use ADL authorizer to check if user is authorized to perform specific {@link FsAction} on specified {@link Path}s
+   *
+   * @param action The {@link FsAction} being requested on the provided {@link Path}s
+   * @param paths The absolute paths of the storage being accessed
+   * @throws AdlAuthorizationException on authorization failure
+   */
+  private void performADLAuthCheck(FsAction action, Path... paths) throws AdlAuthorizationException {
+    if (authorizer == null) {
+      LOG.warn("ADL authorizer is not initialized. No authorization check will be performed.");
+    } else {
+      if (!authorizer.isAuthorized(action, paths)) {
+        Path[] qualifiedPaths = toQualifiedPaths(paths);
+        throw new AdlAuthorizationException(
+            "User is not authorized for action " + action.toString() + " on paths: " + Arrays.toString(qualifiedPaths));
+      }
+    }
+  }
+
+  /**
+   * Convert to qualified paths
+   *
+   * @param paths The absolute paths of the storage being accessed
+   * @return Array of qualified paths
+   */
+  private Path[] toQualifiedPaths(Path... paths) {
+    Path[] qualifiedPaths = new Path[paths.length];
+    for (int i = 0; i < paths.length; i++) {
+      qualifiedPaths[i] = paths[i].makeQualified(getUri(), getWorkingDirectory());
+    }
+    return qualifiedPaths;
   }
 }
