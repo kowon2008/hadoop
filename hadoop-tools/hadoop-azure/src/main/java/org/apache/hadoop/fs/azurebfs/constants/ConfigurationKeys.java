@@ -110,5 +110,8 @@ public final class ConfigurationKeys {
 
   public static final String ABFS_EXTERNAL_AUTHORIZATION_CLASS = "abfs.external.authorization.class";
 
+  /** End point of ABFS account: {@value}. */
+  public static final String AZURE_ABFS_XPOLICY_ENDPOINT = "fs.azure.abfs.xpolicy.endpoint";
+
   private ConfigurationKeys() {}
 }

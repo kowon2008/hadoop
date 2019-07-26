@@ -29,6 +29,7 @@ import java.util.UUID;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLSocketFactory;
 
+import org.apache.hadoop.fs.azurebfs.contracts.services.ListXPoliciesSchema;
 import org.apache.hadoop.fs.azurebfs.utils.SSLSocketFactoryEx;
 import org.codehaus.jackson.JsonFactory;
 import org.codehaus.jackson.JsonParser;
@@ -67,6 +68,7 @@ public class AbfsHttpOperation {
   private String clientRequestId = "";
   private String requestId  = "";
   private ListResultSchema listResultSchema = null;
+  private ListXPoliciesSchema listXPoliciesSchema = null;
 
   // metrics
   private int bytesSent;
@@ -125,6 +127,8 @@ public class AbfsHttpOperation {
   public ListResultSchema getListResultSchema() {
     return listResultSchema;
   }
+
+  public ListXPoliciesSchema getListXPoliciesSchema() { return listXPoliciesSchema; }
 
   public String getResponseHeader(String httpHeader) {
     return connection.getHeaderField(httpHeader);
@@ -299,7 +303,10 @@ public class AbfsHttpOperation {
 
         // this is a list operation and need to retrieve the data
         // need a better solution
-        if (AbfsHttpConstants.HTTP_METHOD_GET.equals(this.method) && buffer == null) {
+        if (this.url.getPort() == AbfsHttpConstants.ABFS_XPOLICY_ENDPOINT_PORT &&
+                AbfsHttpConstants.HTTP_METHOD_GET.equals(this.method) && buffer == null) {
+          parseListXPoliciesResponse(stream);
+        } else if (AbfsHttpConstants.HTTP_METHOD_GET.equals(this.method) && buffer == null) {
           parseListFilesResponse(stream);
         } else {
           if (buffer != null) {
@@ -445,5 +452,30 @@ public class AbfsHttpOperation {
    */
   private boolean isNullInputStream(InputStream stream) {
     return stream == null ? true : false;
+  }
+
+  /**
+   * Parse the list XPolicies response
+   *
+   * @param stream InputStream contains the list XPolicies results.
+   * @throws IOException
+   */
+  private void parseListXPoliciesResponse(final InputStream stream) throws IOException {
+    if (stream == null) {
+      return;
+    }
+
+    if (listXPoliciesSchema != null) {
+      // already parse the response
+      return;
+    }
+
+    try {
+      final ObjectMapper objectMapper = new ObjectMapper();
+      this.listXPoliciesSchema = objectMapper.readValue(stream, ListXPoliciesSchema.class);
+    } catch (IOException ex) {
+      LOG.error("Unable to deserialize list results", ex);
+      throw ex;
+    }
   }
 }

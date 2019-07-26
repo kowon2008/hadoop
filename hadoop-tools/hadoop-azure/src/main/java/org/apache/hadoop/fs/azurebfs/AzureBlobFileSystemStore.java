@@ -69,6 +69,8 @@ import org.apache.hadoop.fs.azurebfs.contracts.exceptions.InvalidUriException;
 import org.apache.hadoop.fs.azurebfs.contracts.services.AzureServiceErrorCode;
 import org.apache.hadoop.fs.azurebfs.contracts.services.ListResultEntrySchema;
 import org.apache.hadoop.fs.azurebfs.contracts.services.ListResultSchema;
+import org.apache.hadoop.fs.azurebfs.contracts.services.ListXPoliciesSchema;
+import org.apache.hadoop.fs.azurebfs.contracts.services.ListXPoliciesEntrySchema;
 import org.apache.hadoop.fs.azurebfs.extensions.ExtensionHelper;
 import org.apache.hadoop.fs.azurebfs.oauth2.AccessTokenProvider;
 import org.apache.hadoop.fs.azurebfs.oauth2.IdentityTransformer;
@@ -79,6 +81,7 @@ import org.apache.hadoop.fs.azurebfs.services.AbfsInputStream;
 import org.apache.hadoop.fs.azurebfs.services.AbfsOutputStream;
 import org.apache.hadoop.fs.azurebfs.services.AbfsPermission;
 import org.apache.hadoop.fs.azurebfs.services.AbfsRestOperation;
+import org.apache.hadoop.fs.azurebfs.services.AbfsXPolicyClient;
 import org.apache.hadoop.fs.azurebfs.services.AuthType;
 import org.apache.hadoop.fs.azurebfs.services.ExponentialRetryPolicy;
 import org.apache.hadoop.fs.azurebfs.services.SharedKeyCredentials;
@@ -105,6 +108,8 @@ import static org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants.ROOT_PAT
 import static org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants.SINGLE_WHITE_SPACE;
 import static org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants.TOKEN_VERSION;
 import static org.apache.hadoop.fs.azurebfs.constants.ConfigurationKeys.AZURE_ABFS_ENDPOINT;
+import static org.apache.hadoop.fs.azurebfs.constants.ConfigurationKeys.AZURE_ABFS_XPOLICY_ENDPOINT;
+
 
 /**
  * Provides the bridging logic between Hadoop's abstract filesystem and Azure Storage.
@@ -115,6 +120,7 @@ public class AzureBlobFileSystemStore implements Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(AzureBlobFileSystemStore.class);
 
   private AbfsClient client;
+  private AbfsXPolicyClient xPolicyClient;
   private URI uri;
   private String userName;
   private String primaryUserGroup;
@@ -183,6 +189,7 @@ public class AzureBlobFileSystemStore implements Closeable {
   @Override
   public void close() throws IOException {
     IOUtils.cleanupWithLogger(LOG, client);
+    IOUtils.cleanupWithLogger(LOG, xPolicyClient);
   }
 
   private String[] authorityParts(URI uri) throws InvalidUriAuthorityException, InvalidUriException {
@@ -230,7 +237,7 @@ public class AzureBlobFileSystemStore implements Closeable {
   }
 
   @VisibleForTesting
-  URIBuilder getURIBuilder(final String hostName, boolean isSecure) {
+  URIBuilder getURIBuilder(final String hostName, final String endPoint, boolean isSecure) {
     String scheme = isSecure ? FileSystemUriSchemes.HTTPS_SCHEME : FileSystemUriSchemes.HTTP_SCHEME;
 
     final URIBuilder uriBuilder = new URIBuilder();
@@ -241,7 +248,6 @@ public class AzureBlobFileSystemStore implements Closeable {
     // the Azure Storage Service URI changes from
     // http[s]://[account][domain-suffix]/[filesystem] to
     // http[s]://[ip]:[port]/[account]/[filesystem].
-    String endPoint = abfsConfiguration.get(AZURE_ABFS_ENDPOINT);
     if (endPoint == null || !endPoint.contains(AbfsHttpConstants.COLON)) {
       uriBuilder.setHost(hostName);
       return uriBuilder;
@@ -625,6 +631,52 @@ public class AzureBlobFileSystemStore implements Closeable {
     return fileStatuses.toArray(new FileStatus[fileStatuses.size()]);
   }
 
+  public boolean checkXPolices(final String permission, final String resource) throws IOException {
+    LOG.debug("checkXPolices username: {} permission: {} resource: {}",
+            userName,
+            permission,
+            resource);
+
+    try {
+      final AbfsHttpOperation result = xPolicyClient.getXPolicies(AbfsHttpConstants.XPOLICY_ABFS_SERVICENAME, null).getResult();
+      ListXPoliciesSchema retrievedSchema = result.getListXPoliciesSchema();
+      if (retrievedSchema == null) {
+        throw new AbfsRestOperationException(
+                AzureServiceErrorCode.PATH_NOT_FOUND.getStatusCode(),
+                AzureServiceErrorCode.PATH_NOT_FOUND.getErrorCode(),
+                "list XPolicies not found",
+                null, result);
+      }
+
+      for (ListXPoliciesEntrySchema entry : retrievedSchema.policies()) {
+        String entryUser = entry.user().trim().toLowerCase();
+        if (entryUser.equals(userName)) {
+          String entryCondition = entry.condition().trim().toLowerCase();
+          if (entryCondition.equals("allow")) {
+            String entryResource = entry.resource().trim().toLowerCase();
+
+            String substring = entryResource;
+            if (entryResource.endsWith("/*")) {
+              substring = entryResource.substring(0, entryResource.length() - 3);
+            } else if (entryResource.endsWith("*")) {
+              substring = entryResource.substring(0, entryResource.length() - 2);
+            }
+
+            if (resource.contains(substring)) {
+              String entryAccessType = entry.accessType().trim().toLowerCase();
+              if (entryAccessType.contains(permission)) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+    } catch (AbfsRestOperationException e) {
+      LOG.warn("No policy defined for service name: " + AbfsHttpConstants.XPOLICY_ABFS_SERVICENAME);
+    }
+    return false;
+  }
+
   // generate continuation token for xns account
   private String generateContinuationTokenForXns(final String firstEntryName) {
     Preconditions.checkArgument(!Strings.isNullOrEmpty(firstEntryName)
@@ -895,19 +947,8 @@ public class AzureBlobFileSystemStore implements Closeable {
 
   private void initializeClient(URI uri, String fileSystemName, String accountName, boolean isSecure)
       throws IOException {
-    if (this.client != null) {
+    if (this.client != null && xPolicyClient != null) {
       return;
-    }
-
-    final URIBuilder uriBuilder = getURIBuilder(accountName, isSecure);
-
-    final String url = uriBuilder.toString() + AbfsHttpConstants.FORWARD_SLASH + fileSystemName;
-
-    URL baseUrl;
-    try {
-      baseUrl = new URL(url);
-    } catch (MalformedURLException e) {
-      throw new InvalidUriException(uri.toString());
     }
 
     SharedKeyCredentials creds = null;
@@ -927,7 +968,35 @@ public class AzureBlobFileSystemStore implements Closeable {
             abfsConfiguration.getRawConfiguration());
     }
 
-    this.client =  new AbfsClient(baseUrl, creds, abfsConfiguration, new ExponentialRetryPolicy(), tokenProvider);
+
+    if (this.client == null) {
+      final URIBuilder uriBuilder = getURIBuilder(accountName, abfsConfiguration.get(AZURE_ABFS_ENDPOINT), isSecure);
+      final String url = uriBuilder.toString() + AbfsHttpConstants.FORWARD_SLASH + fileSystemName;
+      URL baseUrl;
+      try {
+        baseUrl = new URL(url);
+      } catch (MalformedURLException e) {
+        throw new InvalidUriException(uri.toString());
+      }
+      this.client = new AbfsClient(baseUrl, creds, abfsConfiguration, new ExponentialRetryPolicy(), tokenProvider);
+    }
+
+    if (this.xPolicyClient == null) {
+      final URIBuilder uriBuilder = getURIBuilder(accountName, abfsConfiguration.get(AZURE_ABFS_XPOLICY_ENDPOINT), isSecure);
+      final String xPolicyUrl = uriBuilder.toString() +
+              AbfsHttpConstants.FORWARD_SLASH +
+              AbfsHttpConstants.XPOLICY +
+              AbfsHttpConstants.FORWARD_SLASH +
+              AbfsHttpConstants.XPOLICY_ABFS;
+      URL baseXPolicyUrl;
+      try {
+        baseXPolicyUrl = new URL(xPolicyUrl);
+      } catch (MalformedURLException e) {
+        throw new InvalidUriException(uri.toString());
+      }
+      this.xPolicyClient = new AbfsXPolicyClient(
+              baseXPolicyUrl, creds, abfsConfiguration, new ExponentialRetryPolicy(), tokenProvider);
+    }
   }
 
   private String getOctalNotation(FsPermission fsPermission) {

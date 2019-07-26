@@ -1104,29 +1104,31 @@ public class AzureBlobFileSystem extends FileSystem {
     return abfsStore.getIsNamespaceEnabled();
   }
 
-  /**
-   * Use ABFS authorizer to check if user is authorized to perform specific
-   * {@link FsAction} on specified {@link Path}s.
-   *
-   * @param action The {@link FsAction} being requested on the provided {@link Path}s.
-   * @param paths The absolute paths of the storage being accessed.
-   * @throws AbfsAuthorizationException on authorization failure.
-   * @throws IOException network problems or similar.
-   * @throws IllegalArgumentException if the required parameters are not provided.
-   */
-  private void performAbfsAuthCheck(FsAction action, Path... paths)
-      throws AbfsAuthorizationException, IOException {
-    if (authorizer == null) {
-      LOG.debug("ABFS authorizer is not initialized. No authorization check will be performed.");
-    } else {
-      Preconditions.checkArgument(paths.length > 0, "no paths supplied for authorization check");
+  private void performAbfsAuthCheck(FsAction action, Path... paths) throws IOException {
+    boolean authorizationResult = false;
 
-      LOG.debug("Auth check for action: {} on paths: {}", action.toString(), Arrays.toString(paths));
-      if (!authorizer.isAuthorized(action, paths)) {
-        throw new AbfsAuthorizationException(
-            "User is not authorized for action " + action.toString()
-            + " on paths: " + Arrays.toString(paths));
+    for (Path path : paths) {
+      switch (action) {
+        case READ:
+          authorizationResult = abfsStore.checkXPolices("read", path.toUri().getPath());
+          break;
+        case WRITE:
+          authorizationResult = abfsStore.checkXPolices("write", path.toUri().getPath());
+          break;
+        case READ_WRITE:
+          authorizationResult = abfsStore.checkXPolices("read", path.toUri().getPath()) &&
+                  abfsStore.checkXPolices("write", path.toUri().getPath());
+          break;
+        default:
+          throw new IllegalArgumentException("Unsupported action provided: " + action.toString());
       }
+    }
+
+    if (!authorizationResult) {
+      throw new AbfsAuthorizationException(
+              "User is not authorized for action " + action.toString() + " on paths: " + Arrays.toString(paths));
+    } else {
+      LOG.info("User is authorized for action " + action.toString() + " on paths: " + Arrays.toString(paths));
     }
   }
 }

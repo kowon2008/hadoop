@@ -91,6 +91,9 @@ public final class AbfsHttpConstants {
   public static final String DEFAULT_SCOPE = "default:";
   public static final String PERMISSION_FORMAT = "%04d";
   public static final String SUPER_USER = "$superuser";
+  public static final String XPOLICY = "xpolicy";
+  public static final String XPOLICY_ABFS = "abfs";
+  public static final String XPOLICY_ABFS_SERVICENAME = "defaultServiceName";
 
   public static final char CHAR_FORWARD_SLASH = '/';
   public static final char CHAR_EXCLAMATION_POINT = '!';
@@ -99,6 +102,8 @@ public final class AbfsHttpConstants {
   public static final char CHAR_EQUALS = '=';
   public static final char CHAR_STAR = '*';
   public static final char CHAR_PLUS = '+';
+
+  public static final int ABFS_XPOLICY_ENDPOINT_PORT = 8885;
 
   private AbfsHttpConstants() {}
 }
